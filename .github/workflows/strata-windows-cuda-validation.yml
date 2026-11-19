@@ -1,0 +1,67 @@
+name: Strata Windows CUDA validation
+on:
+  push:
+    branches: [codex/edge0-307-windows-cuda-20261119]
+permissions:
+  contents: read
+jobs:
+  windows-cuda:
+    runs-on: windows-2022
+    timeout-minutes: 55
+    env:
+      SOURCE_SHA: 6609699140f715bcb13e96de46a016566e329362
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 6609699140f715bcb13e96de46a016566e329362
+          persist-credentials: false
+      - name: Verify source revision
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD) -ne $env:SOURCE_SHA) { throw 'Unexpected source revision' }
+          git status --porcelain
+      - name: Install CUDA 13.0.3 compiler and libraries
+        shell: pwsh
+        run: |
+          $base = 'https://developer.download.nvidia.com/compute/cuda/redist'
+          $manifest = Invoke-RestMethod "$base/redistrib_13.0.3.json"
+          $root = Join-Path $env:RUNNER_TEMP 'cuda-13.0'
+          $parts = @('cuda_nvcc', 'cuda_crt', 'cuda_cccl', 'cuda_cudart', 'cuda_nvrtc', 'libnvvm', 'libcublas')
+          New-Item -ItemType Directory -Force $root | Out-Null
+          foreach ($part in $parts) {
+            $item = $manifest.$part.'windows-x86_64'
+            if (-not $item.relative_path) { throw "Missing package $part" }
+            $zip = Join-Path $env:RUNNER_TEMP "$part.zip"
+            $staging = Join-Path $env:RUNNER_TEMP $part
+            & curl.exe -fsSL --retry 3 --max-time 360 -o $zip "$base/$($item.relative_path)"
+            if ($LASTEXITCODE -ne 0) { throw "Download failed for $part" }
+            if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $item.sha256) { throw "Hash mismatch for $part" }
+            & 7z x $zip "-o$staging" -y -bso0 -bsp0
+            if ($LASTEXITCODE -ne 0) { throw "Extraction failed for $part" }
+            $tree = @(Get-ChildItem -LiteralPath $staging -Directory)
+            if ($tree.Count -ne 1) { throw "Unexpected archive layout for $part" }
+            Copy-Item -Path (Join-Path $tree[0].FullName '*') -Destination $root -Recurse -Force
+            Remove-Item -LiteralPath $zip
+          }
+          "CUDA_PATH=$root" >> $env:GITHUB_ENV
+          "$root\bin" >> $env:GITHUB_PATH
+          "$root\bin\x64" >> $env:GITHUB_PATH
+          & "$root\bin\nvcc.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'nvcc unavailable' }
+      - name: Build Strata CUDA with Visual Studio 2022
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake -S edge0-strata -B build-strata -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_ARCHITECTURES=89-real "-DCMAKE_CUDA_COMPILER=%CUDA_PATH%\bin\nvcc.exe" "-DCUDAToolkit_ROOT=%CUDA_PATH%" || exit /b 1
+          cmake --build build-strata --target strata --parallel 4 > strata-build.log 2>&1
+          set "build_result=%ERRORLEVEL%"
+          type strata-build.log
+          if not "%build_result%"=="0" exit /b %build_result%
+          if not exist build-strata\strata.exe exit /b 1
+          certutil -hashfile build-strata\strata.exe SHA256
+      - name: Run conversation memory tests in C++23
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          clang-cl /nologo /EHsc /O2 /clang:-std=c++23 /Iedge0-strata\include edge0-strata\src\core\conversation_memory_test.cpp edge0-strata\src\core\conversation_memory.cpp /Fe:conversation_memory_test.exe || exit /b 1
+          conversation_memory_test.exe
